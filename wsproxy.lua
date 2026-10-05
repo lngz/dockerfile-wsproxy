@@ -1,18 +1,12 @@
 local server = require "resty.websocket.server"
 local vstruct = require "vstruct"
 
-local logind_addr = os.getenv("WSPROXY_ADDR")
-local logind_port = os.getenv("WSPROXY_PORT")
 local with_conn_data = os.getenv("WSPROXY_CONN_DATA")
 
 local origin_whitelist = {
-    ["http://www.ptt.cc"] = true,
-    ["https://www.ptt.cc"] = true,
-    ["https://robertabcd.github.io"] = true,
-    ["app://pcman"] = true,
 }
 
-function check_origin()
+local function check_origin()
     local origin = ngx.req.get_headers().origin
 
     if type(origin) ~= "string" then
@@ -25,25 +19,39 @@ function check_origin()
     end
 end
 
-function build_conn_data()
-    local fmt = vstruct.compile("< s32")
+local function ip_to_int(ip)
+    local result = 0
+    local mult = 16777216  -- 256^3
+    for octet in string.gmatch(ip, "([^.]+)") do
+        result = result + (tonumber(octet) * mult)
+        mult = mult / 256
+    end
+    return result
+end
+
+local function build_conn_data()
+    local fmt = vstruct.compile("< I4")
     local remote_addr = ngx.var.http_x_real_ip or ngx.var.remote_addr
 
     return fmt:write({
-        remote_addr
+        ip_to_int(remote_addr)
     })
 end
 
-function connect_mbbsd()
+local function connect_mbbsd()
     local mbbsd = ngx.socket.stream()
-    local ok, err = mbbsd:connect(logind_addr)
+    mbbsd:settimeout(5000)
+    local ok, err = mbbsd:connect("127.0.0.1", 23)
     if not ok then
         ngx.log(ngx.ERR, "failed to connect to mbbsd: ", err)
         return ngx.exit(555)
     end
+    ngx.log(ngx.INFO, "connected to mbbsd ok")
 
     if with_conn_data == "1" then
-        local _, err = mbbsd:send(build_conn_data())
+        local conn_data = build_conn_data()
+        ngx.log(ngx.INFO, "sending conn data: ", #conn_data, " bytes")
+        local _, err = mbbsd:send(conn_data)
         if err then
            ngx.log(ngx.ERR, "failed to send conn data to mbbsd: ", err)
            return ngx.exit(555)
@@ -53,7 +61,7 @@ function connect_mbbsd()
     return mbbsd
 end
 
-function start_websocket_server()
+local function start_websocket_server()
     local ws, err = server:new({
         timeout = 30*60*1000,  -- in milliseconds
         max_payload_len = 65535,
@@ -65,12 +73,13 @@ function start_websocket_server()
     return ws
 end
 
-function ws2sock(ws, sock)
-    last_typ = ""
+local function ws2sock(ws, sock)
+    local last_typ = ""
     while true do
         local data, typ, err = ws:recv_frame()
         if err or not data then
             ngx.log(ngx.ERR, "failed to receive a frame: ", err)
+            sock:close()
             return ngx.exit(444)
         end
 
@@ -79,52 +88,54 @@ function ws2sock(ws, sock)
         end
 
         if typ == "binary" then
-            _, err = sock:send(data)
+            local _, err = sock:send(data)
             if err then
                 ngx.log(ngx.ERR, "failed to send to mbbsd: ", err)
+                sock:close()
                 return ngx.exit(555)
             end
         elseif typ == "close" then
             sock:close()
-            local _, err = ws:send_close(1000, "bye")
+            local bytes, err = ws:send_close(1000, "bye")
             if err then
                 ngx.log(ngx.ERR, "failed to send the close frame: ", err)
-                return
             end
-            local code = err
-            ngx.log(ngx.INFO, "closing with status code ", code, " and message ", data)
+            ngx.log(ngx.INFO, "closing websocket")
             return
         elseif typ == "ping" then
-            -- send a pong frame back:
             local _, err = ws:send_pong(data)
             if err then
-                ngx.log(ngx.ERR, "failed to send frame: ", err)
-                return
+                ngx.log(ngx.ERR, "failed to send pong: ", err)
+                sock:close()
+                return ngx.exit(444)
             end
         elseif typ == "pong" then
-            -- just discard the incoming pong frame
+            -- discard
         else
-            ngx.log(ngx.INFO, "received a frame of type ", typ, " and payload ", data)
+            ngx.log(ngx.INFO, "received frame of type ", typ)
         end
 
         last_typ = typ
     end
 end
 
-function sock2ws(sock, ws)
+local function sock2ws(sock, ws)
     while true do
         sock:settimeout(30*60*1000)
-        data, err = sock:receiveany(1024)
+        local data, err = sock:receiveany(1024)
 
         if not data then
             ws:send_close(1000, "bbs died")
             ngx.log(ngx.ERR, "failed to recv from mbbsd: ", err)
             return ngx.exit(444)
         else
-            bytes, err = ws:send_binary(data)
-            if not bytes then
-                ngx.log(ngx.ERR, "failed to send a binary frame: ", err)
-                return ngx.exit(444)
+            if #data > 0 then
+                local bytes, err = ws:send_binary(data)
+                if not bytes then
+                    ngx.log(ngx.ERR, "failed to send a binary frame: ", err)
+                    sock:close()
+                    return ngx.exit(444)
+                end
             end
         end
     end
@@ -134,7 +145,7 @@ end
 -- need better ACL
 local ws = start_websocket_server()
 local sock = connect_mbbsd()
-ngx.log(ngx.ERR, "client connect over websocket, ",
+ngx.log(ngx.INFO, "client connect over websocket, ",
     ngx.var.server_name, ":", ngx.var.server_port, " ", ngx.var.server_protocol)
 ngx.thread.spawn(ws2sock, ws, sock)
 ngx.thread.spawn(sock2ws, sock, ws)

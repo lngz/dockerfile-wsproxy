@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>GBK Browser Test</title>
+<style>
+  body { font-family: monospace; font-size: 16px; background: #000; color: #fff; padding: 20px; }
+  .pass { color: #0f0; }
+  .fail { color: #f00; }
+  .info { color: #ff0; }
+  pre { background: #222; padding: 10px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>Browser GBK Support Test</h1>
+<div id="results"></div>
+<script>
+var results = document.getElementById('results');
+function log(msg, cls) {
+  var d = document.createElement('div');
+  d.className = cls || 'info';
+  d.textContent = msg;
+  results.appendChild(d);
+}
+
+// Test: Does the browser support TextDecoder('gbk')?
+log('Browser encoding support test:', 'info');
+
+var encodings = ['gbk', 'gb2312', 'gb18030', 'big5', 'utf-8', 'iso-8859-1'];
+for (var i = 0; i < encodings.length; i++) {
+  try {
+    var td = new TextDecoder(encodings[i], {fatal: false});
+    var bytes = new Uint8Array([0xBB, 0xB6]); // GBK '欢'
+    var decoded = td.decode(bytes);
+    log('  ' + encodings[i] + ': supported, 0xBBB6 decodes to "' + decoded + '" (codepoint: 0x' + decoded.charCodeAt(0).toString(16) + ')', decoded === '欢' ? 'pass' : 'fail');
+  } catch(e) {
+    log('  ' + encodings[i] + ': NOT supported - ' + e.message, 'fail');
+  }
+}
+
+// Test: What does the browser's default encoding think about these bytes?
+log('\nRaw byte test:', 'info');
+var rawStr = String.fromCharCode(0xBB, 0xB6, 0xD3, 0xAD, 0xB9, 0xE2, 0xC1, 0xD9);
+log('  Raw string (8 bytes as chars): "' + rawStr + '"');
+log('  Length: ' + rawStr.length);
+
+// Build g2u map using the BEST available encoding
+var bestEncoding = null;
+for (var enc of ['gb18030', 'gbk', 'gb2312']) {
+  try {
+    new TextDecoder(enc);
+    bestEncoding = enc;
+    break;
+  } catch(e) {}
+}
+
+log('\nBest available Chinese encoding: ' + (bestEncoding || 'NONE'), bestEncoding ? 'pass' : 'fail');
+
+if (bestEncoding) {
+  var td = new TextDecoder(bestEncoding, {fatal: false});
+  var bytes = new Uint8Array([0xBB, 0xB6, 0xD3, 0xAD, 0xB9, 0xE2, 0xC1, 0xD9]);
+  log('  Direct decode: "' + td.decode(bytes) + '"', 'info');
+  
+  // Build map
+  var _g2uMap = new Uint16Array(65536);
+  for (var lead = 0x81; lead <= 0xFE; lead++) {
+    for (var trail = 0x40; trail <= 0xFE; trail++) {
+      if (trail === 0x7F) continue;
+      var gbkCode = (lead << 8) | trail;
+      var b = new Uint8Array([lead, trail]);
+      var decoded = td.decode(b);
+      if (decoded && decoded.length > 0 && decoded.charCodeAt(0) !== 0xFFFD) {
+        _g2uMap[gbkCode] = decoded.charCodeAt(0);
+      }
+    }
+  }
+  
+  // g2u
+  function g2u(e) {
+    for (var t, n = '', o = 0; o < e.length; ++o) {
+      if (e.charCodeAt(o) < 128 || o === e.length - 1) {
+        n += e.charAt(o);
+      } else {
+        t = _g2uMap[e.charCodeAt(o) << 8 | e.charCodeAt(o + 1)];
+        if (t) { n += String.fromCharCode(t); o++; } else { n += e.charAt(o); }
+      }
+    }
+    return n;
+  }
+  
+  var wsStr = String.fromCharCode.apply(String, new Uint8Array(bytes));
+  var result = g2u(wsStr);
+  log('  g2u result: "' + result + '"');
+  log('  Expected: "\u6b22\u8fce\u5149\u4e34" (欢迎光临)');
+  log('  Match: ' + (result === '\u6b22\u8fce\u5149\u4e34'), result === '\u6b22\u8fce\u5149\u4e34' ? 'pass' : 'fail');
+  
+  // Write to DOM
+  var domDiv = document.createElement('div');
+  domDiv.textContent = result;
+  domDiv.style.color = '#0f0';
+  domDiv.style.fontSize = '24px';
+  domDiv.style.marginTop = '10px';
+  results.appendChild(domDiv);
+  log('  DOM text rendered above (green, 24px)', 'info');
+}
+</script>
+</body>
+</html>
